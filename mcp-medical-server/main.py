@@ -64,78 +64,108 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
 @app.route('/mcp', methods=['GET', 'POST'])
 def mcp_endpoint():
     """Unified entrypoint matching the Streamable HTTP MCP specification."""
-    # 1. Enforce custom security Wall
+    
+    # 1. Enforce custom security
     if not verify_security_passkey(request.headers):
         return jsonify({"error": "Unauthorized: Invalid Passkey Provided"}), 401
 
-    # Handshake Handling A: Discovery Request (GET /mcp or POST with list method)
+    # 2. GET = simple health/discovery check
     if request.method == 'GET':
-        return jsonify({
-            "mcpVersion": "2024-11-05",
-            "tools": [
-                {
-                    "name": "medical_gcs_search",
-                    "description": "Searches inside approved medical literature PDFs in Google Cloud Storage.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Medical keyword or drug name."},
-                            "max_results": {"type": "integer", "default": 3}
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "report_adverse_event",
-                    "description": "CRITICAL: Call this if inquiry mentions any side effect.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "drug_name": {"type": "string"},
-                            "raw_inquiry_text": {"type": "string"},
-                            "detected_symptoms": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["drug_name", "raw_inquiry_text", "detected_symptoms"]
-                    }
-                }
-            ]
-        })
+        return jsonify({"status": "ok", "mcpVersion": "2024-11-05"})
 
-    # Handshake Handling B: Tool Execution Request (POST /mcp)
+    # 3. All POST requests are JSON-RPC 2.0
     body = request.json or {}
     method = body.get("method")
     params = body.get("params", {})
-    
-    if method == "tools/list":
-        # Safe fallback duplication for clients requesting tool lists via POST
+    request_id = body.get("id")
+
+    # STEP 1 OF HANDSHAKE: initialize
+    if method == "initialize":
         return jsonify({
-            "tools": [
-                {"name": "medical_gcs_search", "description": "Searches GCS reference bucket.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-                {"name": "report_adverse_event", "description": "Reports side effects.", "inputSchema": {"type": "object", "properties": {"drug_name": {"type": "string"}, "raw_inquiry_text": {"type": "string"}, "detected_symptoms": {"type": "array", "items": {"type": "string"}}}, "required": ["drug_name", "raw_inquiry_text"]}}
-            ]
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "Medical-Inquiry-MCP", "version": "1.0.0"}
+            }
         })
 
+    # STEP 2 OF HANDSHAKE: initialized notification (no response needed)
+    if method == "notifications/initialized":
+        return '', 204
+
+    # STEP 3: Tool list
+    if method == "tools/list":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "medical_gcs_search",
+                        "description": "Searches inside approved medical literature PDFs in Google Cloud Storage.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Medical keyword or drug name."},
+                                "max_results": {"type": "integer", "default": 3}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "report_adverse_event",
+                        "description": "CRITICAL: Call this if inquiry mentions any side effect.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "drug_name": {"type": "string"},
+                                "raw_inquiry_text": {"type": "string"},
+                                "detected_symptoms": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["drug_name", "raw_inquiry_text", "detected_symptoms"]
+                        }
+                    }
+                ]
+            }
+        })
+
+    # STEP 4: Tool execution
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
-        
+
         if tool_name == "medical_gcs_search":
             query = arguments.get("query")
             results = search_gcs_documents(query)
             return jsonify({
-                "content": [{"type": "text", "text": json.dumps(results)}]
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(results)}]
+                }
             })
-            
+
         elif tool_name == "report_adverse_event":
             drug = arguments.get("drug_name")
             raw_text = arguments.get("raw_inquiry_text")
             symptoms = arguments.get("detected_symptoms", [])
             msg_id = publish_adverse_event(drug, raw_text, symptoms)
             return jsonify({
-                "content": [{"type": "text", "text": f"Event submitted successfully. ID: {msg_id}"}]
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"Event submitted successfully. ID: {msg_id}"}]
+                }
             })
-            
-    return jsonify({"error": {"code": -32601, "message": "Method not found"}}), 404
+
+    # Unknown method
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32601, "message": "Method not found"}
+    }), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
