@@ -1,11 +1,11 @@
 import os
 import json
+import urllib.request
 from flask import Flask, request, jsonify
 from google.cloud import storage, pubsub_v1
 
 app = Flask(__name__)
 
-# Initialize Google Cloud Clients
 storage_client = storage.Client()
 pubsub_client = pubsub_v1.PublisherClient()
 
@@ -13,31 +13,44 @@ BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pharma-medical-reference-docs")
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 TOPIC_ID = os.getenv("GCP_PUBSUB_TOPIC", "pharmacovigilance-alerts")
 
-# --- TOOL 1: MEDICAL REFERENCE SEARCH ---
+def verify_google_token(auth_header):
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return False
+    token = auth_header.split(" ")[1]
+    
+    # Try validating Token
+    try:
+        url = f"https://googleapis.com{token}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            if "error" not in data:
+                return True
+    except Exception:
+        pass
+    return False
+
+# --- CORE BUSINESS LOGIC ---
 def search_gcs_documents(query: str, max_results: int = 3):
-    """
-    Scans PDFs/text in GCS. In a full production setup, this would query Vertex AI Search 
-    or a vector database like AlloyDB. Here it performs a compliant direct contextual fetch.
-    """
     bucket = storage_client.bucket(BUCKET_NAME)
     blobs = bucket.list_blobs(max_results=10)
     matched_chunks = []
     
     for blob in blobs:
-        if blob.name.endswith('.txt') or blob.name.endswith('.json'):
-            content = blob.download_as_text()
-            # Simple chunk extraction based on query keyword matching
-            if query.lower() in content.lower():
-                matched_chunks.append({
-                    "source": f"gs://{BUCKET_NAME}/{blob.name}",
-                    "text": content[:1500] # Return relevant text snippet
-                })
+        if blob.name.endswith('.txt') or blob.name.endswith('.pdf'):
+            try:
+                content = blob.download_as_text(errors='ignore')
+                if query.lower() in content.lower():
+                    matched_chunks.append({
+                        "source": f"gs://{BUCKET_NAME}/{blob.name}",
+                        "text": content[:1500]
+                    })
+            except Exception:
+                pass
         if len(matched_chunks) >= max_results:
             break
-            
     return matched_chunks
 
-# --- TOOL 2: ADVERSE EVENT EMERGENCY ROUTING ---
 def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
     topic_path = pubsub_client.topic_path(PROJECT_ID, TOPIC_ID)
     payload = {
@@ -50,68 +63,82 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
     future = pubsub_client.publish(topic_path, data)
     return future.result()
 
-# --- MCP AUTO-DISCOVERY ENDPOINT ---
-@app.route('/tools', methods=['GET'])
-def list_tools():
-    """Broadcasts available tools and schemas automatically to Anthropic."""
+# --- OFFICIAL SINGLE MCP ROUTE ---
+@app.route('/mcp', methods=['GET', 'POST'])
+def mcp_endpoint():
+    """Unified entrypoint matching the Streamable HTTP MCP specification."""
+    # 1. Enforce GCP Security Wall
     if not verify_google_token(request.headers.get("Authorization")):
-        return jsonify({"error": "Unauthorized: Invalid Google Token"}), 401
+        return jsonify({"error": "Unauthorized"}), 401
 
-    discovered_tools = [
-        {
-            "name": "medical_gcs_search",
-            "description": "Searches inside approved medical literature PDFs in Google Cloud Storage. Returns text snippets and file paths.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Medical keyword, drug name, or condition (e.g., 'Xenotrin dosage')."},
-                    "max_results": {"type": "integer", "description": "Number of text snippets to return.", "default": 3}
+    # Handshake Handling A: Discovery Request (GET /mcp or POST with list method)
+    if request.method == 'GET':
+        return jsonify({
+            "mcpVersion": "2024-11-05",
+            "tools": [
+                {
+                    "name": "medical_gcs_search",
+                    "description": "Searches inside approved medical literature PDFs in Google Cloud Storage.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Medical keyword or drug name."},
+                            "max_results": {"type": "integer", "default": 3}
+                        },
+                        "required": ["query"]
+                    }
                 },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "report_adverse_event",
-            "description": "CRITICAL: Call this immediately if the inquiry mentions ANY patient side effect, injury, or adverse reaction.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string", "description": "The name of the drug associated with the side effect."},
-                    "raw_inquiry_text": {"type": "string", "description": "The full original text of the HCP inquiry."},
-                    "detected_symptoms": {"type": "array", "items": {"type": "string"}, "description": "List of side effects identified."}
-                },
-                "required": ["drug_name", "raw_inquiry_text", "detected_symptoms"]
-            }
-        }
-    ]
-    return jsonify({"tools": discovered_tools})
+                {
+                    "name": "report_adverse_event",
+                    "description": "CRITICAL: Call this if inquiry mentions any side effect.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "drug_name": {"type": "string"},
+                            "raw_inquiry_text": {"type": "string"},
+                            "detected_symptoms": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["drug_name", "raw_inquiry_text", "detected_symptoms"]
+                    }
+                }
+            ]
+        })
 
-
-# --- MCP ROUTING ENDPOINTS ---
-@app.route('/tools/search', methods=['POST'])
-def handle_search():
-    data = request.json or {}
-    query = data.get("query")
-    max_results = data.get("max_results", 3)
+    # Handshake Handling B: Tool Execution Request (POST /mcp)
+    body = request.json or {}
+    method = body.get("method")
+    params = body.get("params", {})
     
-    if not query:
-        return jsonify({"error": "Missing 'query' parameter"}), 400
-        
-    results = search_gcs_documents(query, max_results)
-    return jsonify({"status": "success", "data": results})
+    if method == "tools/list":
+        # Safe fallback duplication for clients requesting tool lists via POST
+        return jsonify({
+            "tools": [
+                {"name": "medical_gcs_search", "description": "Searches GCS reference bucket.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+                {"name": "report_adverse_event", "description": "Reports side effects.", "inputSchema": {"type": "object", "properties": {"drug_name": {"type": "string"}, "raw_inquiry_text": {"type": "string"}, "detected_symptoms": {"type": "array", "items": {"type": "string"}}}, "required": ["drug_name", "raw_inquiry_text"]}}
+            ]
+        })
 
-@app.route('/tools/report_ae', methods=['POST'])
-def handle_adverse_event():
-    data = request.json or {}
-    drug_name = data.get("drug_name")
-    raw_text = data.get("raw_inquiry_text")
-    symptoms = data.get("detected_symptoms", [])
-    
-    if not drug_name or not raw_text:
-        return jsonify({"error": "Missing required reporting fields"}), 400
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
         
-    message_id = publish_adverse_event(drug_name, raw_text, symptoms)
-    return jsonify({"status": "submitted", "pubsub_message_id": message_id})
+        if tool_name == "medical_gcs_search":
+            query = arguments.get("query")
+            results = search_gcs_documents(query)
+            return jsonify({
+                "content": [{"type": "text", "text": json.dumps(results)}]
+            })
+            
+        elif tool_name == "report_adverse_event":
+            drug = arguments.get("drug_name")
+            raw_text = arguments.get("raw_inquiry_text")
+            symptoms = arguments.get("detected_symptoms", [])
+            msg_id = publish_adverse_event(drug, raw_text, symptoms)
+            return jsonify({
+                "content": [{"type": "text", "text": f"Event submitted successfully. ID: {msg_id}"}]
+            })
+            
+    return jsonify({"error": {"code": -32601, "message": "Method not found"}}), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
