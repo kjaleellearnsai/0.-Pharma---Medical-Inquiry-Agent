@@ -50,6 +50,43 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
     future = pubsub_client.publish(topic_path, data)
     return future.result()
 
+# --- MCP AUTO-DISCOVERY ENDPOINT ---
+@app.route('/tools', methods=['GET'])
+def list_tools():
+    """Broadcasts available tools and schemas automatically to Anthropic."""
+    if not verify_google_token(request.headers.get("Authorization")):
+        return jsonify({"error": "Unauthorized: Invalid Google Token"}), 401
+
+    discovered_tools = [
+        {
+            "name": "medical_gcs_search",
+            "description": "Searches inside approved medical literature PDFs in Google Cloud Storage. Returns text snippets and file paths.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Medical keyword, drug name, or condition (e.g., 'Xenotrin dosage')."},
+                    "max_results": {"type": "integer", "description": "Number of text snippets to return.", "default": 3}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "report_adverse_event",
+            "description": "CRITICAL: Call this immediately if the inquiry mentions ANY patient side effect, injury, or adverse reaction.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "drug_name": {"type": "string", "description": "The name of the drug associated with the side effect."},
+                    "raw_inquiry_text": {"type": "string", "description": "The full original text of the HCP inquiry."},
+                    "detected_symptoms": {"type": "array", "items": {"type": "string"}, "description": "List of side effects identified."}
+                },
+                "required": ["drug_name", "raw_inquiry_text", "detected_symptoms"]
+            }
+        }
+    ]
+    return jsonify({"tools": discovered_tools})
+
+
 # --- MCP ROUTING ENDPOINTS ---
 @app.route('/tools/search', methods=['POST'])
 def handle_search():
