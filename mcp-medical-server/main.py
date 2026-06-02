@@ -13,22 +13,19 @@ BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pharma-medical-reference-docs")
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 TOPIC_ID = os.getenv("GCP_PUBSUB_TOPIC", "pharmacovigilance-alerts")
 
-def verify_google_token(auth_header):
+# --- SIMPLIFIED PRODUCTION DEVELOPMENT GATEWAY ---
+def verify_security_passkey(request_headers):
+    """Validates an explicit custom API header passed securely from Anthropic."""
+    auth_header = request_headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         return False
-    token = auth_header.split(" ")[1]
+        
+    extracted_token = auth_header.split(" ")[1]
     
-    # Try validating Token
-    try:
-        url = f"https://googleapis.com{token}"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
-            if "error" not in data:
-                return True
-    except Exception:
-        pass
-    return False
+    # We match this against an environment variable stored safely in Cloud Run
+    expected_secret = os.getenv("ANTHROPIC_MCP_SECRET", "PharmaSecretPasskey2026!")
+    return extracted_token == expected_secret
+
 
 # --- CORE BUSINESS LOGIC ---
 def search_gcs_documents(query: str, max_results: int = 3):
@@ -67,9 +64,9 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
 @app.route('/mcp', methods=['GET', 'POST'])
 def mcp_endpoint():
     """Unified entrypoint matching the Streamable HTTP MCP specification."""
-    # 1. Enforce GCP Security Wall
-    if not verify_google_token(request.headers.get("Authorization")):
-        return jsonify({"error": "Unauthorized"}), 401
+    # 1. Enforce custom security Wall
+    if not verify_security_passkey(request.headers):
+        return jsonify({"error": "Unauthorized: Invalid Passkey Provided"}), 401
 
     # Handshake Handling A: Discovery Request (GET /mcp or POST with list method)
     if request.method == 'GET':
