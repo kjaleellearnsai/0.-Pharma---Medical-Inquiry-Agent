@@ -31,33 +31,37 @@ def verify_security_passkey(request_headers):
 
 # --- ROBUST TEXT & PDF RETRIEVAL LOGIC ---
 def search_gcs_documents(query: str, max_results: int = 3):
-    """Scans and extracts text content from TXT and binary PDF files in GCS."""
+    """Scans GCS files by splitting long queries into individual keyword tokens."""
     bucket = storage_client.bucket(BUCKET_NAME)
     blobs = bucket.list_blobs()
     matched_chunks = []
     
+    # Split incoming long strings (e.g. "Xenotrin storage temperature") into individual keywords
+    query_words = [word.lower().strip() for word in query.split(" ") if len(word.strip()) > 2]
+    
+    if not query_words:
+        return []
+
     for blob in blobs:
         file_text = ""
         try:
-            # Handle standard text documents
             if blob.name.endswith('.txt') or blob.name.endswith('.json'):
-                file_text = blob.download_as_text(errors='ignore')
+                file_text = blob.download_as_text(errors='ignore').lower()
                 
-            # Handle binary PDF documents cleanly in-memory
             elif blob.name.endswith('.pdf'):
                 pdf_bytes = blob.download_as_bytes()
                 pdf_file = io.BytesIO(pdf_bytes)
                 reader = PdfReader(pdf_file)
-                # Concatenate readable text from all pages
-                file_text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()])
+                file_text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()]).lower()
                 
-            # Perform clean case-insensitive keyword match
-            if file_text and query.lower() in file_text.lower():
-                matched_chunks.append({
-                    "source": f"gs://{BUCKET_NAME}/{blob.name}",
-                    "text": file_text[:1500] # Return the first 1500 contextual characters
-                })
-                
+            if file_text:
+                # ALL words in the query must be present in the document text (AND logic)
+                if all(word in file_text for word in query_words):
+                    matched_chunks.append({
+                        "source": f"gs://{BUCKET_NAME}/{blob.name}",
+                        "text": file_text[:1500]  # Grab the relevant text window
+                    })
+                    
         except Exception as e:
             print(f"Error parsing file {blob.name}: {str(e)}")
             
@@ -65,18 +69,6 @@ def search_gcs_documents(query: str, max_results: int = 3):
             break
             
     return matched_chunks
-
-def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
-    topic_path = pubsub_client.topic_path(PROJECT_ID, TOPIC_ID)
-    payload = {
-        "event_type": "ADVERSE_EVENT_FLAG",
-        "drug": drug_name,
-        "flagged_symptoms": symptoms,
-        "original_message": raw_text
-    }
-    data = json.dumps(payload).encode("utf-8")
-    future = pubsub_client.publish(topic_path, data)
-    return future.result()
 
 # --- OFFICIAL JSON-RPC 2.0 MCP ROUTE ---
 @app.route('/mcp', methods=['GET', 'POST'])
