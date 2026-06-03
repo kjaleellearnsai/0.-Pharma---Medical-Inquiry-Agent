@@ -5,6 +5,7 @@ import uuid
 import datetime
 from flask import Flask, request, jsonify
 from google.cloud import storage, pubsub_v1, bigquery
+import pg8000.native
 from pypdf import PdfReader
 
 app = Flask(__name__)
@@ -18,6 +19,15 @@ BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pharma-medical-reference-docs")
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "medical-inquiry-agent")
 TOPIC_ID = os.getenv("GCP_PUBSUB_TOPIC", "pharmacovigilance-alerts")
 BIGQUERY_TABLE_REF = f"{PROJECT_ID}.telemetry_data.agent_logs"
+
+def get_db_connection():
+    """Establishes a connection to the Cloud SQL PostgreSQL instance via local Unix sockets."""
+    return pg8000.native.Connection(
+        user="postgres",
+        password=os.getenv("DB_PASSWORD", "SecurePharmaPass2026!"),
+        host=f"/cloudsql/{PROJECT_ID}:us-central1:pharma-dashboard-db",
+        database="postgres"
+    )
 
 def verify_security_passkey(request_headers):
     auth_header = request_headers.get("Authorization")
@@ -54,7 +64,7 @@ def search_gcs_documents(query: str, max_results: int = 3):
                     "text": file_text[:1500]
                 })
         except Exception as e:
-            print(f"CRITICAL ERROR: Exception parsing file {blob.name}. Details: {str(e)}")
+            print(f"Exception parsing file {blob.name}: {str(e)}")
             
         if len(matched_chunks) >= max_results:
             break
@@ -72,9 +82,7 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
     future = pubsub_client.publish(topic_path, data)
     return future.result()
 
-# --- NEW: BIGQUERY TELEMETRY STREAMING LAYER ---
 def log_transaction_to_bigquery(raw_query, keywords, doc_count, pv_triggered, draft=""):
-    """Streams transaction payloads directly into your BigQuery dataset."""
     rows_to_insert = [
         {
             "inquiry_id": str(uuid.uuid4()),
@@ -87,13 +95,11 @@ def log_transaction_to_bigquery(raw_query, keywords, doc_count, pv_triggered, dr
         }
     ]
     try:
-        errors = bq_client.insert_rows_json(BIGQUERY_TABLE_REF, rows_to_insert)
-        if errors:
-            print(f"BigQuery Insert Errors Detected: {errors}")
+        bq_client.insert_rows_json(BIGQUERY_TABLE_REF, rows_to_insert)
     except Exception as e:
-        print(f"Asynchronous telemetry recording failed: {str(e)}")
+        print(f"Telemetry logging failed: {str(e)}")
 
-# --- COMPLIANT JSON-RPC 2.0 ROUTING WITH TELEMETRY INTERCEPT ---
+# --- COMPLIANT JSON-RPC 2.0 MCP ROUTE WITH CLOUD SQL WRITE-BACK ---
 @app.route('/mcp', methods=['GET', 'POST'])
 def mcp_endpoint():
     if not verify_security_passkey(request.headers):
@@ -165,24 +171,21 @@ def mcp_endpoint():
             results = search_gcs_documents(query_string)
             doc_count = len(results)
             
-            # AUTOMATED TRACKING INTERCEPT
-            # If the database returns 0 results, we log the details to BigQuery immediately
             if doc_count == 0:
-                print(f"DATA GAP ALERT: Query '{query_string}' returned zero matching files. Streaming event to BigQuery.")
-                log_transaction_to_bigquery(
-                    raw_query=query_string,
-                    keywords=query_string,
-                    doc_count=0,
-                    pv_triggered=False,
-                    draft="No internal data matched. Systematic grounding fallback triggered."
-                )
+                log_transaction_to_bigquery(query_string, query_string, 0, False, "No data matched.")
+                # Transactional Cloud SQL Entry for Standard Data Gaps
+                inquiry_uuid = str(uuid.uuid4())
+                db = get_db_connection()
+                try:
+                    db.run(
+                        "INSERT INTO inbound_data_gaps (inquiry_id, hcp_raw_query, extracted_keywords, status) VALUES (:id, :query, :keywords, :status)",
+                        id=inquiry_uuid, query=query_string, keywords=query_string, status="UNRESOLVED"
+                    )
+                finally:
+                    db.close()
             
             return jsonify({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps(results)}]
-                }
+                "jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(results)}]}
             })
             
         elif tool_name == "report_adverse_event":
@@ -191,27 +194,25 @@ def mcp_endpoint():
             symptoms = arguments.get("detected_symptoms", [])
             msg_id = publish_adverse_event(drug, raw_text, symptoms)
             
-            # Log the safety alert event directly to BigQuery for metrics tracking
-            log_transaction_to_bigquery(
-                raw_query=raw_text,
-                keywords=drug,
-                doc_count=0,
-                pv_triggered=True,
-                draft=f"Safety warning sent to Pub/Sub. Message ID: {msg_id}"
-            )
+            log_transaction_to_bigquery(raw_text, drug, 0, True, f"Safety warning published. Message ID: {msg_id}")
+            
+            # PATH A IMPLEMENTATION: Transactional Cloud SQL Entry for Critical Safety Events
+            inquiry_uuid = str(uuid.uuid4())
+            db = get_db_connection()
+            try:
+                db.run(
+                    "INSERT INTO inbound_data_gaps (inquiry_id, hcp_raw_query, extracted_keywords, status) VALUES (:id, :query, :keywords, :status)",
+                    id=inquiry_uuid, query=raw_text, keywords=drug, status="CRITICAL_SAFETY_ALERT"
+                )
+            finally:
+                db.close()
             
             return jsonify({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [{"type": "text", "text": f"Event submitted successfully. ID: {msg_id}"}]
-                }
+                "jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": f"Event flagged as CRITICAL_SAFETY_ALERT. ID: {msg_id}"}]}
             })
 
     return jsonify({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "error": {"code": -32601, "message": "Method not found"}
+        "jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}
     }), 404
 
 if __name__ == '__main__':
