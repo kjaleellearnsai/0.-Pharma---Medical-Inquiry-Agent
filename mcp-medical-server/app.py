@@ -1,76 +1,109 @@
 import streamlit as st
 import pandas as pd
-from google.cloud import bigquery
+import pg8000.native
 
 # 1. Configure global professional layout for the medical desk
 st.set_page_config(page_title="Pharma Medical Affairs Dashboard", layout="wide")
 
-# 2. Initialize BigQuery client
-bq_client = bigquery.Client(project="medical-inquiry-agent")
+# 2. Connection function targeting our running local proxy tunnel
+def get_db_connection():
+    return pg8000.native.Connection(
+        user="postgres",
+        password="SecurePharmaPass2026!",
+        host="127.0.0.1",
+        port=5432,
+        database="postgres"
+    )
 
 st.title("🔬 Medical Affairs - MSL Copilot Dashboard")
 st.markdown("---")
 
-# 3. GLOBAL DATA FETCH: Execute the query before building columns so 'df' is universally accessible
-sql_query = """
-    SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, documents_returned_count 
-    FROM `medical-inquiry-agent.telemetry_data.agent_logs`
-    WHERE documents_returned_count = 0
-    ORDER BY timestamp DESC
-    LIMIT 10
-"""
-
-# Fetch the data into a universally accessible global dataframe
+# 3. GLOBAL DATA FETCH: Read outstanding gaps and safety instances
 try:
-    df = bq_client.query(sql_query).to_dataframe()
-except Exception as e:
-    st.error(f"Failed to query telemetry logs: {str(e)}")
-    df = pd.DataFrame() # Fallback to empty container to prevent application crash
+    db = get_db_connection()
+    # Pull unresolved standard gaps and critical safety alerts, forcing critical to float to the top
+    cursor = db.run(
+        "SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, status "
+        "FROM inbound_data_gaps "
+        "WHERE status != 'RESOLVED' "
+        "ORDER BY CASE WHEN status = 'CRITICAL_SAFETY_ALERT' THEN 1 ELSE 2 END, timestamp DESC"
+    )
+    
+    # Process records cleanly into a dataframe using mapping lists
+    columns = [desc['name'] for desc in cursor.description] if cursor.description else []
+    df = pd.DataFrame(cursor.mappings()) if cursor.rows else pd.DataFrame(columns=columns)
+finally:
+    db.close()
 
 # 4. BUILD THE USER INTERFACE COLUMNS
 col_queue, col_workbench = st.columns(2)
 
 with col_queue:
-    st.subheader("🚨 System Audit Queue (Data Gaps Detected)")
-    st.caption("The following incoming HCP queries returned zero matching files from our clinical storage bucket:")
+    st.subheader("🚨 Transactional Operation Desk Queue")
+    st.caption("Active data gaps and critical safety alerts fetched directly from Cloud SQL:")
     
     if df.empty:
-        st.success("🎉 Clean Audit Desk: No unresolved data gaps found in BigQuery.")
+        st.success("🎉 Operational Review Queue is Clear. Excellent job!")
     else:
-        # Display rows as an interactive data spreadsheet component
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        # Loop through rows and display color-coded status banners
+        for index, row in df.iterrows():
+            if row['status'] == 'CRITICAL_SAFETY_ALERT':
+                st.error(
+                    f"⚠️ **CRITICAL SAFETY ALERT** | ID: `{row['inquiry_id']}`\n\n"
+                    f"**HCP Question:** {row['hcp_raw_query']}"
+                )
+            else:
+                st.warning(
+                    f"📋 **Standard Data Gap** | ID: `{row['inquiry_id']}`\n\n"
+                    f"**HCP Question:** {row['hcp_raw_query']}"
+                )
 
 with col_workbench:
-    st.subheader("🛠️ Actionable Review Desk")
-    st.markdown("Select a specific transaction to manually review and provide data override updates.")
+    st.subheader("🛠️ Active Manual Override Workbench")
+    st.markdown("Select an outstanding case to view parameters and process responses.")
     
     if not df.empty:
-        # Create a dropdown menu listing all logged inquiry IDs requiring attention
-        selected_id = st.selectbox("Select Actionable Inquiry ID to Resolve", df["inquiry_id"].unique())
+        selected_id = st.selectbox("Select Transaction to Process", df["inquiry_id"].unique())
         
-        # Filter the selected row data safely using loc
+        # Safely isolate the chosen record row
         active_record = df[df["inquiry_id"] == selected_id].iloc[0]
         
-        st.info(f"**Raw HCP Question Asked:**\n\n {active_record['hcp_raw_query']}")
-        
-        # Human Input Form Fields
-        st.markdown("#### MSL Human Intervention Actions")
-        msl_text_override = st.text_area(
-            "Paste Verified Medical Reference / Local PDF Content here:",
-            placeholder="Type or paste approved clinical journal snippets or standard response template paragraphs..."
-        )
-        
-        final_draft = st.text_area(
-            "Refined Compliant Response Draft to HCP:",
-            placeholder="Dear Doctor, in response to your inquiry regarding Xenotrin..."
-        )
-        
-        # Action Dispatch Button
-        if st.button("Approve, Log Override, and Dispatch to CRM"):
-            if not msl_text_override or not final_draft:
-                st.warning("Please complete both form inputs to document the manual override process correctly.")
-            else:
-                st.success(f"Transaction {selected_id} resolved! Logged by MSL, overriding response data sent to CRM tracking queue.")
-                st.balloons()
+        # UI Safety Constraint: If an item is an adverse event, lock the input fields
+        if active_record['status'] == 'CRITICAL_SAFETY_ALERT':
+            st.error(
+                "🔒 **Safety Case Locked**: This inquiry contains an adverse event and has been fully automated "
+                "and dispatched straight to Global Pharmacovigilance via Pub/Sub. No text modification is permitted here."
+            )
+            # Render a disabled template button for strict compliance tracking
+            st.button("Archive Safety Alert Record from UI Desk", disabled=True)
+        else:
+            st.info(f"**Standard Data Gap Question:**\n\n {active_record['hcp_raw_query']}")
+            
+            # Interactive Review Form
+            msl_override = st.text_area("Paste Verified Reference Literature:")
+            final_draft = st.text_area("Refined Compliant Response Draft to HCP:")
+            
+            if st.button("Approve and Dispatch to CRM"):
+                if not msl_override or not final_draft:
+                    st.warning("Please complete both form inputs before submission.")
+                else:
+                    # Write resolution back to Cloud SQL and mark case as RESOLVED
+                    db = get_db_connection()
+                    try:
+                        db.run(
+                            "INSERT INTO msl_resolutions (inquiry_id, msl_pasted_reference, final_approved_response) "
+                            "VALUES (:id, :ref, :draft)", 
+                            id=selected_id, ref=msl_override, draft=final_draft
+                        )
+                        db.run(
+                            "UPDATE inbound_data_gaps SET status = 'RESOLVED' WHERE inquiry_id = :id", 
+                            id=selected_id
+                        )
+                    finally:
+                        db.close()
+                        
+                    st.success("Transaction successfully updated to RESOLVED state.")
+                    st.balloons()
+                    st.rerun()
     else:
         st.info("The operational review workbench is currently idle because the alert queue is clear.")
