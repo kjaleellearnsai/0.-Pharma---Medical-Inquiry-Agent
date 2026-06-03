@@ -2,40 +2,43 @@ import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 
-# Configure a wide professional layout for the pharmaceutical audit desk
+# 1. Configure global professional layout for the medical desk
 st.set_page_config(page_title="Pharma Medical Affairs Dashboard", layout="wide")
 
-# Initialize our native BigQuery engine client
-# It automatically picks up your active gcloud terminal login credentials
+# 2. Initialize BigQuery client
 bq_client = bigquery.Client(project="medical-inquiry-agent")
 
 st.title("🔬 Medical Affairs - MSL Copilot Dashboard")
 st.markdown("---")
 
-# Left Column: Operational Alert Queue | Right Column: Active Manual Override Workbench
-col_queue, col_workbench = st.columns([1, 1])
+# 3. GLOBAL DATA FETCH: Execute the query before building columns so 'df' is universally accessible
+sql_query = """
+    SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, documents_returned_count 
+    FROM `medical-inquiry-agent.telemetry_data.agent_logs`
+    WHERE documents_returned_count = 0
+    ORDER BY timestamp DESC
+    LIMIT 10
+"""
+
+# Fetch the data into a universally accessible global dataframe
+try:
+    df = bq_client.query(sql_query).to_dataframe()
+except Exception as e:
+    st.error(f"Failed to query telemetry logs: {str(e)}")
+    df = pd.DataFrame() # Fallback to empty container to prevent application crash
+
+# 4. BUILD THE USER INTERFACE COLUMNS
+col_queue, col_workbench = st.columns(2)
 
 with col_queue:
     st.subheader("🚨 System Audit Queue (Data Gaps Detected)")
     st.caption("The following incoming HCP queries returned zero matching files from our clinical storage bucket:")
     
-    # Live fetch the exact log records you just verified in BigQuery
-    sql_query = """
-        SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, documents_returned_count 
-        FROM `medical-inquiry-agent.telemetry_data.agent_logs`
-        WHERE documents_returned_count = 0
-        ORDER BY timestamp DESC
-        LIMIT 10
-    """
-    try:
-        df = bq_client.query(sql_query).to_dataframe()
-        if df.empty:
-            st.success("🎉 Clean Audit Desk: No unresolved data gaps found in BigQuery.")
-        else:
-            # Display rows as an interactive data spreadsheet component
-            st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"Failed to query telemetry logs: {str(e)}")
+    if df.empty:
+        st.success("🎉 Clean Audit Desk: No unresolved data gaps found in BigQuery.")
+    else:
+        # Display rows as an interactive data spreadsheet component
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 with col_workbench:
     st.subheader("🛠️ Actionable Review Desk")
@@ -45,7 +48,7 @@ with col_workbench:
         # Create a dropdown menu listing all logged inquiry IDs requiring attention
         selected_id = st.selectbox("Select Actionable Inquiry ID to Resolve", df["inquiry_id"].unique())
         
-        # Filter the selected row data
+        # Filter the selected row data safely using loc
         active_record = df[df["inquiry_id"] == selected_id].iloc[0]
         
         st.info(f"**Raw HCP Question Asked:**\n\n {active_record['hcp_raw_query']}")
