@@ -18,22 +18,28 @@ def get_db_connection():
 st.title("🔬 Medical Affairs - MSL Copilot Dashboard")
 st.markdown("---")
 
+
 # 3. GLOBAL DATA FETCH: Read outstanding gaps and safety instances
 try:
     db = get_db_connection()
-    # Pull unresolved standard gaps and critical safety alerts, forcing critical to float to the top
-    cursor = db.run(
+    
+    # Execute query (returns a standard Python list of rows)
+    rows = db.run(
         "SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, status "
         "FROM inbound_data_gaps "
         "WHERE status != 'RESOLVED' "
         "ORDER BY CASE WHEN status = 'CRITICAL_SAFETY_ALERT' THEN 1 ELSE 2 END, timestamp DESC"
     )
     
-    # Process records cleanly into a dataframe using mapping lists
-    columns = [desc['name'] for desc in cursor.description] if cursor.description else []
-    df = pd.DataFrame(cursor.mappings()) if cursor.rows else pd.DataFrame(columns=columns)
+    # Extract the column names directly from the db connection metadata
+    column_names = [col['name'] for col in db.columns] if db.columns else ["inquiry_id", "timestamp", "hcp_raw_query", "extracted_keywords", "status"]
+    
+    # Construct DataFrame by matching the list of rows to the extracted column headers
+    df = pd.DataFrame(rows, columns=column_names) if rows else pd.DataFrame(columns=column_names)
+    
 finally:
     db.close()
+
 
 # 4. BUILD THE USER INTERFACE COLUMNS
 col_queue, col_workbench = st.columns(2)
