@@ -89,17 +89,18 @@ else:
         st.markdown("Select an outstanding case to view parameters and process responses.")
         
         if not df.empty:
-            # 🟢 STEP 1: Extract unique ticket IDs and insert the clean prompt string token at index 0
+            # Extract unique ticket IDs and insert the placeholder prompt string at index 0
             unique_ids = list(df["inquiry_id"].unique())
             dropdown_options = ["---Select Transaction---"] + unique_ids
             
             selected_id = st.selectbox("Select Transaction to Process", options=dropdown_options)
             
-            # 🟢 STEP 2: Enforce conditional check—only expand form fields if a real UUID is active
+            # Enforce conditional check—only expand form fields if a real UUID is active
             if selected_id == "---Select Transaction---":
                 st.info("💡 **Desk Standby**: Please choose a specific transaction ID from the selection menu above to open the manual processing form fields.")
             else:
-                active_record = df[df["inquiry_id"] == selected_id].iloc
+                # 🟢 THE DEFINITIVE PLATFORM FIX: Extract the specific row index item [0] cleanly to prevent indexing errors!
+                active_record = df[df["inquiry_id"] == selected_id].iloc[0]
                 
                 if active_record['status'] == 'CRITICAL_SAFETY_ALERT':
                     st.error("🔒 **Safety Case Locked**: This inquiry contains an adverse event and has been fully automated and routed straight to Global Pharmacovigilance. No human modification permitted here.")
@@ -134,3 +135,4 @@ else:
                             st.rerun()
         else:
             st.info("The operational review workbench is currently idle because the alert queue is clear.")
+            
