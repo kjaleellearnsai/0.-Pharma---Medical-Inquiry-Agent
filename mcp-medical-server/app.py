@@ -1,19 +1,31 @@
 import streamlit as st
 import pandas as pd
 import pg8000.native
+import os
 
 # Configure global professional layout for the medical desk
 st.set_page_config(page_title="Pharma Medical Affairs Dashboard", layout="wide")
 
-# Connection function targeting our running local proxy tunnel
+# 🟢 ENVIRONMENT-AWARE ROUTING: Detects if running on GCP or local desktop machine
 def get_db_connection():
-    return pg8000.native.Connection(
-        user="postgres",
-        password="SecurePharmaPass2026!",
-        host="127.0.0.1",
-        port=5432,
-        database="postgres"
-    )
+    # Cloud Run automatically injects K_SERVICE or Cloud SQL variables into active container threads
+    if os.getenv("K_SERVICE") or os.path.exists("/cloudsql"):
+        # Live Cloud connection socket path matching your main.py setup
+        return pg8000.native.Connection(
+            user="postgres",
+            password="SecurePharmaPass2026!",
+            database="postgres",
+            unix_sock="/cloudsql/medical-inquiry-agent:us-central1:pharma-dashboard-db/.s.PGSQL.5432"
+        )
+    else:
+        # Fallback local testing parameters using your running desktop proxy tunnel
+        return pg8000.native.Connection(
+            user="postgres",
+            password="SecurePharmaPass2026!",
+            host="127.0.0.1",
+            port=5432,
+            database="postgres"
+        )
 
 st.title("🔬 Medical Affairs - MSL Copilot Dashboard")
 st.markdown("---")
@@ -21,11 +33,14 @@ st.markdown("---")
 # Toggle between open action items and full historical audits
 view_mode = st.sidebar.radio("Select Dashboard View Mode:", ("Active Action Queue", "Full Historical Audit Log"))
 
+# 🟢 ROBUST SCOPE INITIALIZATION: Initialize variable as None to eliminate NameErrors
+db = None
+df = pd.DataFrame()
+
 try:
     db = get_db_connection()
     
     if view_mode == "Active Action Queue":
-        # Pull ONLY records requiring human intervention, filtering out completed AI & HITL rows
         rows = db.run(
             "SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, status "
             "FROM inbound_data_gaps "
@@ -33,7 +48,6 @@ try:
             "ORDER BY CASE WHEN status = 'CRITICAL_SAFETY_ALERT' THEN 1 ELSE 2 END, timestamp DESC"
         )
     else:
-        # Full historical data dump for regulatory compliance inspectors
         rows = db.run(
             "SELECT inquiry_id, timestamp, hcp_raw_query, extracted_keywords, status "
             "FROM inbound_data_gaps "
@@ -42,8 +56,12 @@ try:
         
     column_names = [col['name'] for col in db.columns] if db.columns else ["inquiry_id", "timestamp", "hcp_raw_query", "extracted_keywords", "status"]
     df = pd.DataFrame(rows, columns=column_names) if rows else pd.DataFrame(columns=column_names)
+except Exception as conn_err:
+    st.error(f"❌ Database Connectivity Error: Could not reach the Cloud SQL instance backend. Details: {str(conn_err)}")
 finally:
-    db.close()
+    # 🟢 SAFE CLEANUP LAYER: Only call close() if the connection variable was successfully initialized
+    if db is not None:
+        db.close()
 
 
 # DYNAMIC LAYOUT ENGINE SWITCHBOARD
@@ -89,29 +107,28 @@ else:
         st.markdown("Select an outstanding case to view parameters and process responses.")
         
         if not df.empty:
-            # Extract unique ticket IDs and insert the placeholder prompt string at index 0
             unique_ids = list(df["inquiry_id"].unique())
             dropdown_options = ["---Select Transaction---"] + unique_ids
             
             selected_id = st.selectbox("Select Transaction to Process", options=dropdown_options)
             
-            # Enforce conditional check—only expand form fields if a real UUID is active
             if selected_id == "---Select Transaction---":
                 st.info("💡 **Desk Standby**: Please choose a specific transaction ID from the selection menu above to open the manual processing form fields.")
             else:
-                # 🟢 THE DEFINITIVE PLATFORM FIX: Extract the specific row index item [0] cleanly to prevent indexing errors!
                 active_record = df[df["inquiry_id"] == selected_id].iloc[0]
                 
                 if active_record['status'] == 'CRITICAL_SAFETY_ALERT':
                     st.error("🔒 **Safety Case Locked**: This inquiry contains an adverse event and has been fully automated and routed straight to Global Pharmacovigilance. No human modification permitted here.")
                     if st.button("Archive Safety Alert Record from UI Desk"):
-                        db = get_db_connection()
+                        db_action = None
                         try:
-                            db.run("UPDATE inbound_data_gaps SET status = 'RESOLVED_BY_HITL' WHERE inquiry_id = :id", id=selected_id)
+                            db_action = get_db_connection()
+                            db_action.run("UPDATE inbound_data_gaps SET status = 'RESOLVED_BY_HITL' WHERE inquiry_id = :id", id=selected_id)
+                            st.success("Safety alert archived from the active desk.")
+                            st.rerun()
                         finally:
-                            db.close()
-                        st.success("Safety alert archived from the active desk.")
-                        st.rerun()
+                            if db_action is not None:
+                                db_action.close()
                 else:
                     st.info(f"**Standard Data Gap Question:**\n\n {active_record['hcp_raw_query']}")
                     msl_override = st.text_area("Paste Verified Reference Literature:")
@@ -121,18 +138,20 @@ else:
                         if not msl_override or not final_draft:
                             st.warning("Please complete both form inputs to document the manual override process correctly.")
                         else:
-                            db = get_db_connection()
+                            db_action = None
                             try:
-                                db.run(
+                                db_action = get_db_connection()
+                                db_action.run(
                                     "INSERT INTO msl_resolutions (inquiry_id, msl_pasted_reference, final_approved_response) VALUES (:id, :ref, :draft)",
                                     id=selected_id, ref=msl_override, draft=final_draft
                                 )
-                                db.run("UPDATE inbound_data_gaps SET status = 'RESOLVED_BY_HITL' WHERE inquiry_id = :id", id=selected_id)
+                                db_action.run("UPDATE inbound_data_gaps SET status = 'RESOLVED_BY_HITL' WHERE inquiry_id = :id", id=selected_id)
+                                st.success("Transaction updated to RESOLVED_BY_HITL state.")
+                                st.balloons()
+                                st.rerun()
                             finally:
-                                db.close()
-                            st.success("Transaction updated to RESOLVED_BY_HITL state.")
-                            st.balloons()
-                            st.rerun()
+                                if db_action is not None:
+                                    db_action.close()
         else:
             st.info("The operational review workbench is currently idle because the alert queue is clear.")
             

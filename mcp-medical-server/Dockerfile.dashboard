@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Cleaned package layer: Removed the missing software-properties-common utility entirely
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy your local requirements matrix and install dependencies
+COPY requirements-dashboard.txt .
+RUN pip install --no-cache-dir -r requirements-dashboard.txt
+
+# Copy your polished dashboard app file
+COPY app.py .
+
+# Streamlit exposes configurations natively on port 8080 for GCP Cloud Run matching
+EXPOSE 8080
+
+ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0"]
