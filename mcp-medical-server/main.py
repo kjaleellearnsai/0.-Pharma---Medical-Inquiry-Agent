@@ -86,13 +86,13 @@ def search_omnirag_vector_matrix(query: str, tenant_namespace: str = "pharma-med
         raw_response = pinecone_index.query(
             namespace=tenant_namespace,
             vector=query_vector,
-            top_k=1, # Keep it at 1 for direct lookup verification
+            top_k=4, # Keep it at 1 for direct lookup verification
             include_metadata=True
         )
         
         matched_chunks = []
         # CRITICAL MED-AFFAIRS COMPLIANCE SETTING: Enforce a strict minimum cosine score limit
-        SIMILARITY_THRESHOLD = 0.82
+        SIMILARITY_THRESHOLD = 0.72
         
         if raw_response and hasattr(raw_response, "matches") and raw_response.matches:
             for idx, match in enumerate(raw_response.matches):
