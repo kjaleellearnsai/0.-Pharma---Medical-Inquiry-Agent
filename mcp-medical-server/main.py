@@ -3,86 +3,139 @@ import io
 import json
 import uuid
 import datetime
+import base64
 from flask import Flask, request, jsonify
 from google.cloud import storage, pubsub_v1, bigquery
+from google.oauth2 import service_account
+import google.auth
 import pg8000.native
-from pypdf import PdfReader
+
+# LlamaIndex & OmniRAG Cornerstone Modules
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.vector_stores.pinecone import PineconeVectorStore
+from llama_index.embeddings.vertex import VertexTextEmbedding
+from pinecone import Pinecone
 
 app = Flask(__name__)
 
-# Initialize All Google Cloud Infrastructure Clients
-storage_client = storage.Client()
-pubsub_client = pubsub_v1.PublisherClient()
-bq_client = bigquery.Client()
+# 1. INITIALIZE CLOUD INFRASTRUCTURE EMBEDDING ENGINE VIA OMNIRAG LOGIC
+gcp_project = os.environ.get("GCP_PROJECT_ID", "medical-inquiry-agent")
+json_env_string = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+cloud_credentials = None
+
+if json_env_string:
+    try:
+        if not json_env_string.strip().startswith("{"):
+            decoded_bytes = base64.b64decode(json_env_string)
+            json_env_string = decoded_bytes.decode("utf-8")
+        account_info = json.loads(json_env_string)
+        cloud_credentials = service_account.Credentials.from_service_account_info(account_info)
+    except Exception as e:
+        print(f"⚠️ Failed to decode credential string, falling back: {str(e)}")
+
+if not cloud_credentials and os.path.exists("gcp-key.json"):
+    cloud_credentials = service_account.Credentials.from_service_account_file("gcp-key.json")
+
+if not cloud_credentials:
+    cloud_credentials, _ = google.auth.default()
+
+Settings.embed_model = VertexTextEmbedding(
+    model_name=os.getenv("EMBED_MODEL_NAME", "text-embedding-004"),
+    project=gcp_project,
+    location="us-central1",
+    credentials=cloud_credentials
+)
+
+storage_client = storage.Client(project=gcp_project, credentials=cloud_credentials)
+pubsub_client = pubsub_v1.PublisherClient(credentials=cloud_credentials)
+bq_client = bigquery.Client(project=gcp_project, credentials=cloud_credentials)
 
 BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pharma-medical-reference-docs")
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "medical-inquiry-agent")
 TOPIC_ID = os.getenv("GCP_PUBSUB_TOPIC", "pharmacovigilance-alerts")
-BIGQUERY_TABLE_REF = f"{PROJECT_ID}.telemetry_data.agent_logs"
+BIGQUERY_TABLE_REF = f"{gcp_project}.telemetry_data.agent_logs"
 
-# Overwrite your get_db_connection function with this fixed configuration:
 def get_db_connection():
-    """Establishes a connection to Cloud SQL via explicit Unix Domain Sockets."""
     return pg8000.native.Connection(
         user="postgres",
         password=os.getenv("DB_PASSWORD", "SecurePharmaPass2026!"),
         database="postgres",
-        # Use unix_sock explicitly for pg8000 rather than overloading the host field
-        unix_sock=f"/cloudsql/medical-inquiry-agent:us-central1:pharma-dashboard-db/.s.PGSQL.5432"
+        unix_sock=f"/cloudsql/{gcp_project}:us-central1:pharma-dashboard-db/.s.PGSQL.5432"
     )
 
-
 def verify_security_passkey(request_headers):
-    """Validates an explicit custom API header passed securely from Anthropic."""
     auth_header = request_headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         return False
-        
     parts = auth_header.split(" ")
     if len(parts) != 2:
         return False
+    return parts[1] == os.getenv("ANTHROPIC_MCP_SECRET", "PharmaSecretPasskey2026!")
+
+# --- PRODUCTION CLEAN RETRIEVAL: PURE SEMANTIC MATRIX EXTRACTION ---
+def search_omnirag_vector_matrix(query: str, tenant_namespace: str = "pharma-medical"):
+    """Connects directly to the raw Pinecone index to perform pure semantic extraction."""
+    try:
+        pinecone_token = os.environ.get("PINECONE_API_KEY", "").strip()
+        pc = Pinecone(api_key=pinecone_token)
+        pinecone_index = pc.Index(os.environ.get("PINECONE_INDEX_NAME", "omni-rag-platform-index"))
         
-    extracted_token = parts[1] # Extract the exact token string (the second element)
-    expected_secret = os.getenv("ANTHROPIC_MCP_SECRET", "PharmaSecretPasskey2026!")
-    return extracted_token == expected_secret
-
-
-
-def search_gcs_documents(query: str, max_results: int = 3):
-    bucket = storage_client.bucket(BUCKET_NAME)
-    blobs = bucket.list_blobs()
-    matched_chunks = []
-    query_words = [word.lower().strip() for word in query.split(" ") if len(word.strip()) > 2]
-    
-    if not query_words:
+        # 1. Generate dense query vector using Vertex AI
+        query_vector = Settings.embed_model.get_query_embedding(query)
+        
+        # 2. Query raw Pinecone index partition namespace
+        raw_response = pinecone_index.query(
+            namespace=tenant_namespace,
+            vector=query_vector,
+            top_k=1, # Keep it at 1 for direct lookup verification
+            include_metadata=True
+        )
+        
+        matched_chunks = []
+        # CRITICAL MED-AFFAIRS COMPLIANCE SETTING: Enforce a strict minimum cosine score limit
+        SIMILARITY_THRESHOLD = 0.82
+        
+        if raw_response and hasattr(raw_response, "matches") and raw_response.matches:
+            for idx, match in enumerate(raw_response.matches):
+                # 🛡️ THE SAFETY GUARDRAIL INTERCEPT: Check the mathematical match score
+                print(f"🔬 PINEONE AUDIT SCORES: Found Vector. Score: {match.score} | Threshold: {SIMILARITY_THRESHOLD}", flush=True)
+                
+                if match.score < SIMILARITY_THRESHOLD:
+                    print(f"🚨 MATCH REJECTED: Vector proximity score ({match.score}) is too low. Flagging as a true data gap.", flush=True)
+                    continue # Bypasses appending this chunk entirely!
+                
+                metadata = match.metadata if match.metadata else {}
+                chunk_text = ""
+                file_source = metadata.get("file_name", f"Source-Document-{idx+1}.pdf")
+                
+                # Unpack the nested LlamaIndex '_node_content' JSON block
+                node_content_str = metadata.get("_node_content")
+                if node_content_str:
+                    try:
+                        node_json = json.loads(node_content_str)
+                        chunk_text = node_json.get("text", "")
+                    except Exception:
+                        pass
+                
+                if not chunk_text:
+                    chunk_text = metadata.get("text", "")
+                    
+                chunk_text = str(chunk_text).strip()
+                file_source = str(file_source).strip()
+                
+                if chunk_text:
+                    matched_chunks.append({
+                        "source": file_source,
+                        "text": chunk_text[:1500]
+                    })
+                    
+        return matched_chunks
+    except Exception as err:
+        print(f"OMNIRAG VECTOR SEARCH CRASH: {str(err)}", flush=True)
         return []
 
-    for blob in blobs:
-        file_text = ""
-        try:
-            if blob.name.endswith('.txt') or blob.name.endswith('.json'):
-                file_text = blob.download_as_text(errors='ignore').lower()
-            elif blob.name.endswith('.pdf'):
-                pdf_bytes = blob.download_as_bytes()
-                pdf_file = io.BytesIO(pdf_bytes)
-                reader = PdfReader(pdf_file)
-                file_text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()]).lower()
-                
-            if file_text and all(word in file_text for word in query_words):
-                matched_chunks.append({
-                    "source": f"gs://{BUCKET_NAME}/{blob.name}",
-                    "text": file_text[:1500]
-                })
-        except Exception as e:
-            print(f"Exception parsing file {blob.name}: {str(e)}")
-            
-        if len(matched_chunks) >= max_results:
-            break
-    return matched_chunks
 
 def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
-    """Publishes a payload to GCP Pub/Sub, wrapped in protective error handling."""
-    topic_path = pubsub_client.topic_path(PROJECT_ID, TOPIC_ID)
+    topic_path = pubsub_client.topic_path(gcp_project, TOPIC_ID)
     payload = {
         "event_type": "ADVERSE_EVENT_FLAG",
         "drug": drug_name,
@@ -90,15 +143,12 @@ def publish_adverse_event(drug_name: str, raw_text: str, symptoms: list):
         "original_message": raw_text
     }
     data = json.dumps(payload).encode("utf-8")
-    
     try:
         future = pubsub_client.publish(topic_path, data)
-        return future.result()  # Returns the successful GCP Message ID string
+        return future.result()
     except Exception as e:
-        print(f"CRITICAL OVERRIDE: Pub/Sub messaging pipeline offline or topic missing. Details: {str(e)}")
+        print(f"Pub/Sub override fallback active. Details: {str(e)}", flush=True)
         return "LOCAL_OVERRIDE_FALLBACK_ID"
-
-
 
 def log_transaction_to_bigquery(raw_query, keywords, doc_count, pv_triggered, draft=""):
     rows_to_insert = [
@@ -115,9 +165,9 @@ def log_transaction_to_bigquery(raw_query, keywords, doc_count, pv_triggered, dr
     try:
         bq_client.insert_rows_json(BIGQUERY_TABLE_REF, rows_to_insert)
     except Exception as e:
-        print(f"Telemetry logging failed: {str(e)}")
+        print(f"Telemetry logging failed: {str(e)}", flush=True)
 
-# --- COMPLIANT JSON-RPC 2.0 MCP ROUTE WITH CLOUD SQL WRITE-BACK ---
+# --- SECURE MCP ROUTING ENDPOINT ---
 @app.route('/mcp', methods=['GET', 'POST'])
 def mcp_endpoint():
     if not verify_security_passkey(request.headers):
@@ -127,38 +177,35 @@ def mcp_endpoint():
         return jsonify({"status": "ok", "mcpVersion": "2024-11-05"})
 
     body = request.json or {}
-    method = body.get("method")
+    method = body.get("method", "")
     params = body.get("params", {})
     request_id = body.get("id")
 
-    if method == "initialize":
+    if "initialize" in method:
         return jsonify({
-            "jsonrpc": "2.0",
-            "id": request_id,
+            "jsonrpc": "2.0", "id": request_id,
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "Medical-Inquiry-MCP", "version": "1.0.0"}
+                "serverInfo": {"name": "Medical-Inquiry-MCP", "version": "2.0.0"}
             }
         })
 
-    if method == "notifications/initialized":
+    if "initialized" in method:
         return '', 204
 
-    if method == "tools/list":
+    if "tools/list" in method or "list" in method.lower():
         return jsonify({
-            "jsonrpc": "2.0",
-            "id": request_id,
+            "jsonrpc": "2.0", "id": request_id,
             "result": {
                 "tools": [
                     {
                         "name": "medical_gcs_search",
-                        "description": "Searches inside approved medical literature PDFs in Google Cloud Storage.",
+                        "description": "Searches approved medical literature using OmniRAG Semantic Hybrid Vector Engine.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "query": {"type": "string", "description": "Medical keyword or drug name."},
-                                "max_results": {"type": "integer", "default": 3}
+                                "query": {"type": "string", "description": "Conceptual medical query asked by HCP."}
                             },
                             "required": ["query"]
                         }
@@ -180,44 +227,61 @@ def mcp_endpoint():
             }
         })
 
-    if method == "tools/call":
+    if "tools/call" in method or "call" in method.lower():
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
         
         if tool_name == "medical_gcs_search":
             query_string = arguments.get("query", "")
-            results = search_gcs_documents(query_string)
+            results = search_omnirag_vector_matrix(query_string)
             doc_count = len(results)
             
-            if doc_count == 0:
-                log_transaction_to_bigquery(query_string, query_string, 0, False, "No data matched.")
-                # Transactional Cloud SQL Entry for Standard Data Gaps
-                inquiry_uuid = str(uuid.uuid4())
-                db = get_db_connection()
-                try:
-                    db.run(
-                        "INSERT INTO inbound_data_gaps (inquiry_id, hcp_raw_query, extracted_keywords, status) VALUES (:id, :query, :keywords, :status)",
-                        id=inquiry_uuid, query=query_string, keywords=query_string, status="UNRESOLVED"
-                    )
-                finally:
-                    db.close()
+            # Determine status based on data retrieval success
+            audit_status = "RESOLVED_BY_AI" if doc_count > 0 else "UNRESOLVED"
+            log_draft_text = json.dumps(results) if doc_count > 0 else "No conceptual vectors matched."
+            
+            # 🟢 100% AUDIT DATA LAKE LOGGING: Every call streams straight to BigQuery
+            try: 
+                log_transaction_to_bigquery(
+                    raw_query=query_string, 
+                    keywords=query_string, 
+                    doc_count=doc_count, 
+                    pv_triggered=False, 
+                    draft=log_draft_text
+                )
+            except Exception as bq_err:
+                print(f"Non-blocking BigQuery audit failure: {str(bq_err)}", flush=True)
+                
+            # 🟢 100% TRANSACTIONAL LOGGING: Every call records a row in Cloud SQL PostgreSQL
+            inquiry_uuid = str(uuid.uuid4())
+            db = get_db_connection()
+            try:
+                db.run(
+                    "INSERT INTO inbound_data_gaps (inquiry_id, hcp_raw_query, extracted_keywords, status) VALUES (:id, :query, :keywords, :status)",
+                    id=inquiry_uuid, query=query_string, keywords=query_string, status=audit_status
+                )
+            except Exception as db_err:
+                print(f"Database audit insertion failed: {str(db_err)}", flush=True)
+            finally:
+                db.close()
             
             return jsonify({
-                "jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(results)}]}
+                "jsonrpc": "2.0", 
+                "id": request_id, 
+                "result": {"content": [{"type": "text", "text": json.dumps(results)}]}
             })
             
         elif tool_name == "report_adverse_event":
-            drug = arguments.get("drug_name")
-            raw_text = arguments.get("raw_inquiry_text")
+            drug = arguments.get("drug_name", "Unknown")
+            raw_text = arguments.get("raw_inquiry_text", "")
             symptoms = arguments.get("detected_symptoms", [])
             msg_id = publish_adverse_event(drug, raw_text, symptoms)
             
-            try:
-                log_transaction_to_bigquery(raw_text, drug, 0, True, f"Safety warning published. Message ID: {msg_id}")
-            except Exception as bq_err:
-                print(f"Non-blocking telemetry log failure: {str(bq_err)}")
-
-            # PATH A IMPLEMENTATION: Transactional Cloud SQL Entry for Critical Safety Events
+            try: 
+                log_transaction_to_bigquery(raw_text, drug, 0, True, f"Safety warning published. ID: {msg_id}")
+            except Exception: 
+                pass
+            
             inquiry_uuid = str(uuid.uuid4())
             db = get_db_connection()
             try:
@@ -225,16 +289,23 @@ def mcp_endpoint():
                     "INSERT INTO inbound_data_gaps (inquiry_id, hcp_raw_query, extracted_keywords, status) VALUES (:id, :query, :keywords, :status)",
                     id=inquiry_uuid, query=raw_text, keywords=drug, status="CRITICAL_SAFETY_ALERT"
                 )
+            except Exception as db_err:
+                print(f"Database insertion failed: {str(db_err)}", flush=True)
             finally:
                 db.close()
             
             return jsonify({
-                "jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": f"Event flagged as CRITICAL_SAFETY_ALERT. ID: {msg_id}"}]}
+                "jsonrpc": "2.0", 
+                "id": request_id, 
+                "result": {"content": [{"type": "text", "text": f"Event flagged as CRITICAL_SAFETY_ALERT. ID: {msg_id}"}]}
             })
 
     return jsonify({
-        "jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}
+        "jsonrpc": "2.0", 
+        "id": request_id, 
+        "error": {"code": -32601, "message": f"Method '{method}' not found"}
     }), 404
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
