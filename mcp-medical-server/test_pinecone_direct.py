@@ -4,9 +4,22 @@ from pinecone import Pinecone
 from llama_index.embeddings.vertex import VertexTextEmbedding
 import google.auth
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 # Explicitly assign your active testing project identity
-os.environ["GOOGLE_CLOUD_PROJECT"] = "medical-inquiry-agent"
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "medical-inquiry-agent")
 credentials, project = google.auth.default()
+
+pinecone_api_key = os.environ.get("PINECONE_API_KEY", "").strip()
+if not pinecone_api_key:
+    raise RuntimeError("Set PINECONE_API_KEY in .env or your environment.")
+
+index_name = os.environ.get("PINECONE_INDEX_NAME", "omni-rag-platform-index")
 
 # 1. Initialize the embedding engine locally to convert text strings to vectors
 print("🤖 Initializing Vertex AI Text Embedding Model...")
@@ -18,8 +31,8 @@ embed_model = VertexTextEmbedding(
 )
 
 # 2. Establish direct link to the Pinecone Serverless matrix endpoints
-pc = Pinecone(api_key="pcsk_5WF7nd_KBiRp8MjcYiEGdu4MAX1atC2ww8SatsYud6Ao5Y8DA9rqaRinMnx24XfgPm7A8G")
-pinecone_index = pc.Index("omni-rag-platform-index")
+pc = Pinecone(api_key=pinecone_api_key)
+pinecone_index = pc.Index(index_name)
 
 print("\n--- 🔍 Running Raw In-Memory Vector Similarity Match ---")
 search_phrase = "What is the standard approved storage temperature protocol for adult dosages of Xenotrin?"

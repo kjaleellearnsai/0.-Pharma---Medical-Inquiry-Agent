@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+*.pyc
+__pycache__/
+.venv/
+venv/
+gcp-key.json
+**/cloud-sql-proxy.exe
