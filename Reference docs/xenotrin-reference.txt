@@ -1,0 +1,5 @@
+DOCUMENT_ID: Investigator Brochure Section 5.1
+PRODUCT_NAME: Xenotrin
+INDICATIONS: Approved solely for adult patients over 18 for chronic migraine management. Safety and efficacy have not been established in pediatric or toddler populations.
+DOSAGE: The standard approved adult dosage of Xenotrin is 10mg once daily. Dosages exceeding 10mg have shown increased risk of gastrointestinal distress.
+STORAGE: Xenotrin adult dosages must be stored securely at room temperature between 20°C to 25°C (68°F to 77°F). Keep away from direct moisture.
