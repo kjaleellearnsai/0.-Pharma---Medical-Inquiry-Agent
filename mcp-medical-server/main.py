@@ -55,21 +55,27 @@ TOPIC_ID = os.getenv("GCP_PUBSUB_TOPIC", "pharmacovigilance-alerts")
 BIGQUERY_TABLE_REF = f"{gcp_project}.telemetry_data.agent_logs"
 
 def get_db_connection():
+    db_password = os.getenv("DB_PASSWORD", "").strip()
+    if not db_password:
+        raise RuntimeError("DB_PASSWORD environment variable is required.")
     return pg8000.native.Connection(
         user="postgres",
-        password=os.getenv("DB_PASSWORD", "SecurePharmaPass2026!"),
+        password=db_password,
         database="postgres",
         unix_sock=f"/cloudsql/{gcp_project}:us-central1:pharma-dashboard-db/.s.PGSQL.5432"
     )
 
 def verify_security_passkey(request_headers):
+    expected_secret = os.getenv("ANTHROPIC_MCP_SECRET", "").strip()
+    if not expected_secret:
+        return False
     auth_header = request_headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         return False
     parts = auth_header.split(" ")
     if len(parts) != 2:
         return False
-    return parts[1] == os.getenv("ANTHROPIC_MCP_SECRET", "PharmaSecretPasskey2026!")
+    return parts[1] == expected_secret
 
 # --- PRODUCTION CLEAN RETRIEVAL: PURE SEMANTIC MATRIX EXTRACTION ---
 def search_omnirag_vector_matrix(query: str, tenant_namespace: str = "pharma-medical"):

@@ -8,12 +8,16 @@ st.set_page_config(page_title="Pharma Medical Affairs Dashboard", layout="wide")
 
 # 🟢 ENVIRONMENT-AWARE ROUTING: Detects if running on GCP or local desktop machine
 def get_db_connection():
+    db_password = os.getenv("DB_PASSWORD", "").strip()
+    if not db_password:
+        raise RuntimeError("DB_PASSWORD environment variable is required.")
+
     # Cloud Run automatically injects K_SERVICE or Cloud SQL variables into active container threads
     if os.getenv("K_SERVICE") or os.path.exists("/cloudsql"):
         # Live Cloud connection socket path matching your main.py setup
         return pg8000.native.Connection(
             user="postgres",
-            password="SecurePharmaPass2026!",
+            password=db_password,
             database="postgres",
             unix_sock="/cloudsql/medical-inquiry-agent:us-central1:pharma-dashboard-db/.s.PGSQL.5432"
         )
@@ -21,7 +25,7 @@ def get_db_connection():
         # Fallback local testing parameters using your running desktop proxy tunnel
         return pg8000.native.Connection(
             user="postgres",
-            password="SecurePharmaPass2026!",
+            password=db_password,
             host="127.0.0.1",
             port=5432,
             database="postgres"
